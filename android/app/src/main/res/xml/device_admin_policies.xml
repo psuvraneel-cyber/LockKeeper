@@ -1,0 +1,5 @@
+<device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-policies>
+        <!-- Friction policy: activation forces user through deactivation screen before uninstall -->
+    </uses-policies>
+</device-admin>

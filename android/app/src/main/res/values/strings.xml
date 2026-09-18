@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LockKeeper</string>
+    <string name="accessibility_service_description">LockKeeper monitors foreground window changes to enforce PIN protection on selected apps and prevent unauthorized deactivation in Settings.</string>
+</resources>
