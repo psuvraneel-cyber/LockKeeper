@@ -37,9 +37,39 @@ class OverlayManager private constructor(private val context: Context) {
     private var currentPackageName: String? = null
 
     @Volatile
-    private var activeSession: com.lockkeeper.app.security.TamperSession? = null
+    private var activeTamperSessionId: String? = null
+    @Volatile
+    private var activeTamperSession: com.lockkeeper.app.security.TamperSession? = null
+
+    @Volatile
+    private var accessibilityServiceContext: Context? = null
+    @Volatile
+    private var currentWindowManager: WindowManager? = null
+
+    fun registerAccessibilityService(service: Context) {
+        accessibilityServiceContext = service
+    }
+
+    fun unregisterAccessibilityService() {
+        accessibilityServiceContext = null
+    }
+
+    private fun getActiveWindowManager(): WindowManager {
+        val a11y = accessibilityServiceContext
+        return if (a11y != null) {
+            try {
+                a11y.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            } catch (_: Exception) {
+                windowManager
+            }
+        } else {
+            windowManager
+        }
+    }
 
     fun isOverlayShowing(): Boolean = currentOverlayView != null
+
+    fun getActiveAdminSessionId(): String? = activeTamperSessionId
 
     fun isInputMethodPackage(pkg: String?): Boolean {
         if (pkg == null) return false
@@ -63,8 +93,13 @@ class OverlayManager private constructor(private val context: Context) {
     @Volatile
     private var currentGateType: GateType? = null
 
-    private fun createLayoutParams(): WindowManager.LayoutParams {
-        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+    private fun createLayoutParams(forceApplicationOverlay: Boolean = false): WindowManager.LayoutParams {
+        val a11yContext = accessibilityServiceContext
+        val type = if (!forceApplicationOverlay && a11yContext != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+            // TYPE_ACCESSIBILITY_OVERLAY is an official system overlay placed above all other windows.
+            // Crucially, it is EXEMPT from HIDE_NON_SYSTEM_OVERLAY_WINDOWS which Android Settings uses to hide normal alert windows!
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         } else {
             @Suppress("DEPRECATION")
@@ -158,12 +193,28 @@ class OverlayManager private constructor(private val context: Context) {
         session: com.lockkeeper.app.security.TamperSession? = null,
         onDismissAction: (Boolean) -> Unit
     ) {
-        if (currentOverlayView != null && currentGateType == GateType.ADMIN && currentPackageName == targetPackage) {
+        val targetSessionId = session?.sessionId
+        // IDEMPOTENCY CHECK:
+        // If an Admin overlay is already showing for this exact active session, DO NOTHING.
+        // Do NOT tear down and recreate the view. This eliminates visual flicker and window races!
+        if (currentOverlayView != null &&
+            currentGateType == GateType.ADMIN &&
+            activeTamperSessionId != null &&
+            activeTamperSessionId == targetSessionId
+        ) {
             return
         }
 
-        activeSession = session
+        activeTamperSessionId = targetSessionId
+        activeTamperSession = session
+        val capturedSessionId = targetSessionId
+
         mainHandler.post {
+            // Check if session was superseded or invalidated while post was queued
+            if (capturedSessionId != null && activeTamperSessionId != capturedSessionId) {
+                return@post
+            }
+
             removeCurrentOverlayInternal()
             lateinit var view: AdminOverlayView
             view = AdminOverlayView(
@@ -172,11 +223,24 @@ class OverlayManager private constructor(private val context: Context) {
                     CoroutineScope(Dispatchers.IO).launch {
                         val authResult = repository.tamperController.verifyAdminPassword(password)
                         mainHandler.post {
+                            // STALE CALLBACK GUARD: Confirm captured session is still active
+                            if (capturedSessionId != null && activeTamperSessionId != capturedSessionId) {
+                                return@post
+                            }
                             when (authResult) {
                                 is com.lockkeeper.app.security.AdminAuthResult.Success -> {
                                     repository.decisionEngine.grantAdminGraceWindow()
-                                    repository.tamperController.endSession(true)
-                                    activeSession = null
+                                    if (capturedSessionId != null) {
+                                        repository.tamperController.endSession(
+                                            sessionId = capturedSessionId,
+                                            terminalState = com.lockkeeper.app.security.TamperSessionState.AUTHORIZED,
+                                            reason = "Admin password verified successfully"
+                                        )
+                                    } else {
+                                        repository.tamperController.endSession(true)
+                                    }
+                                    activeTamperSessionId = null
+                                    activeTamperSession = null
                                     removeCurrentOverlayInternal()
                                     onDismissAction(true)
                                 }
@@ -191,10 +255,23 @@ class OverlayManager private constructor(private val context: Context) {
                     }
                 },
                 onCancelClicked = {
-                    repository.tamperController.endSession(false)
-                    activeSession = null
-                    removeCurrentOverlayInternal()
-                    onDismissAction(false)
+                    // STALE CALLBACK GUARD:
+                    if (capturedSessionId == null || activeTamperSessionId == capturedSessionId) {
+                        if (capturedSessionId != null) {
+                            repository.tamperController.endSession(
+                                sessionId = capturedSessionId,
+                                terminalState = com.lockkeeper.app.security.TamperSessionState.CANCELLED,
+                                reason = "User cancelled admin prompt"
+                            )
+                        } else {
+                            repository.tamperController.endSession(false)
+                        }
+                        activeTamperSessionId = null
+                        activeTamperSession = null
+                        removeCurrentOverlayInternal()
+                        navigateHome()
+                        onDismissAction(false)
+                    }
                 }
             )
 
@@ -203,7 +280,9 @@ class OverlayManager private constructor(private val context: Context) {
                 val lockoutSec = repository.tamperController.checkLockout()
                 if (lockoutSec != null) {
                     mainHandler.post {
-                        view.showLockout(lockoutSec)
+                        if (capturedSessionId == null || activeTamperSessionId == capturedSessionId) {
+                            view.showLockout(lockoutSec)
+                        }
                     }
                 }
             }
@@ -236,17 +315,45 @@ class OverlayManager private constructor(private val context: Context) {
     }
 
     private fun attachOverlay(view: View, packageName: String, gateType: GateType) {
+        val wm = getActiveWindowManager()
         try {
-            val params = createLayoutParams()
-            windowManager.addView(view, params)
+            val params = createLayoutParams(forceApplicationOverlay = (wm == windowManager))
+            wm.addView(view, params)
+            currentWindowManager = wm
             currentOverlayView = view
             currentPackageName = packageName
             currentGateType = gateType
         } catch (e: Exception) {
+            // If adding via accessibility WindowManager fails, attempt fallback via application WindowManager
+            if (wm != windowManager) {
+                try {
+                    val fallbackParams = createLayoutParams(forceApplicationOverlay = true)
+                    windowManager.addView(view, fallbackParams)
+                    currentWindowManager = windowManager
+                    currentOverlayView = view
+                    currentPackageName = packageName
+                    currentGateType = gateType
+                    return
+                } catch (fallbackEx: Exception) {
+                    android.util.Log.e("OverlayManager", "Fallback attach also failed", fallbackEx)
+                }
+            }
             currentOverlayView = null
+            currentWindowManager = null
             currentPackageName = null
             currentGateType = null
-            activeSession = null
+            val sid = activeTamperSessionId
+            if (sid != null) {
+                repository.tamperController.endSession(
+                    sessionId = sid,
+                    terminalState = com.lockkeeper.app.security.TamperSessionState.TERMINAL_DENIAL,
+                    reason = "Overlay attachment failed: ${e.message}"
+                )
+            } else if (gateType == GateType.ADMIN) {
+                repository.tamperController.endSession(false)
+            }
+            activeTamperSessionId = null
+            activeTamperSession = null
             // INV-317: Fail-closed fallback: If overlay fails to attach, target app must not remain usable!
             navigateHome()
         }
@@ -261,14 +368,10 @@ class OverlayManager private constructor(private val context: Context) {
 
         mainHandler.post {
             if (currentGateType == GateType.ADMIN) {
-                // If an admin overlay is showing:
-                // Do not dismiss if the event is within the same target package (e.g. transient settings dialogs)
-                if (packageName != null && packageName == currentPackageName) {
-                    return@post
-                }
-                repository.tamperController.endSession(false)
-                activeSession = null
-                removeCurrentOverlayInternal()
+                // CRITICAL SECURITY GUARANTEE:
+                // An active ADMIN tamper session MUST NOT be dismissed by generic package transitions or observations!
+                // OBSERVATION != TERMINATION.
+                return@post
             } else {
                 // If the foreground package is Allowed, dismiss any non-admin overlay cleanly
                 removeCurrentOverlayInternal()
@@ -277,11 +380,21 @@ class OverlayManager private constructor(private val context: Context) {
     }
 
     @Synchronized
-    fun dismissAdminOverlay() {
+    fun dismissAdminOverlay(sessionId: String? = null) {
         mainHandler.post {
             if (currentGateType == GateType.ADMIN) {
-                repository.tamperController.endSession(false)
-                activeSession = null
+                val sid = sessionId ?: activeTamperSessionId
+                if (sid != null) {
+                    repository.tamperController.endSession(
+                        sessionId = sid,
+                        terminalState = com.lockkeeper.app.security.TamperSessionState.CANCELLED,
+                        reason = "Explicit dismissAdminOverlay invoked"
+                    )
+                } else {
+                    repository.tamperController.endSession(false)
+                }
+                activeTamperSessionId = null
+                activeTamperSession = null
                 removeCurrentOverlayInternal()
             }
         }
@@ -291,8 +404,18 @@ class OverlayManager private constructor(private val context: Context) {
     fun dismissAll() {
         mainHandler.post {
             if (currentGateType == GateType.ADMIN) {
-                repository.tamperController.endSession(false)
-                activeSession = null
+                val sid = activeTamperSessionId
+                if (sid != null) {
+                    repository.tamperController.endSession(
+                        sessionId = sid,
+                        terminalState = com.lockkeeper.app.security.TamperSessionState.INTERRUPTED,
+                        reason = "dismissAll invoked"
+                    )
+                } else {
+                    repository.tamperController.endSession(false)
+                }
+                activeTamperSessionId = null
+                activeTamperSession = null
             }
             removeCurrentOverlayInternal()
         }
@@ -300,15 +423,21 @@ class OverlayManager private constructor(private val context: Context) {
 
     private fun removeCurrentOverlayInternal() {
         currentOverlayView?.let { view ->
+            val wm = currentWindowManager ?: getActiveWindowManager()
             try {
-                windowManager.removeViewImmediate(view)
+                wm.removeViewImmediate(view)
             } catch (e: Exception) {
                 try {
-                    windowManager.removeView(view)
-                } catch (ignored: Exception) {}
+                    wm.removeView(view)
+                } catch (ignored: Exception) {
+                    try {
+                        windowManager.removeView(view)
+                    } catch (_: Exception) {}
+                }
             }
         }
         currentOverlayView = null
+        currentWindowManager = null
         currentPackageName = null
         currentGateType = null
     }

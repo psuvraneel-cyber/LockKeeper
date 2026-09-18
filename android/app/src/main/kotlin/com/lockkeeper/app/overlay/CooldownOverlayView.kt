@@ -26,6 +26,8 @@ class CooldownOverlayView(
         orientation = VERTICAL
         gravity = Gravity.CENTER
         setBackgroundColor(Color.parseColor("#090D16"))
+        isClickable = true
+        isFocusable = true
         isFocusableInTouchMode = true
         requestFocus()
 
@@ -116,6 +118,15 @@ class CooldownOverlayView(
     override fun onDetachedFromWindow() {
         timer?.cancel()
         super.onDetachedFromWindow()
+    }
+
+    override fun dispatchTouchEvent(ev: android.view.MotionEvent): Boolean {
+        super.dispatchTouchEvent(ev)
+        return true
+    }
+
+    override fun onTouchEvent(event: android.view.MotionEvent): Boolean {
+        return true
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {

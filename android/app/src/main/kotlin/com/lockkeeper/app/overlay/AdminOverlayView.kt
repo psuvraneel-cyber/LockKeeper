@@ -29,6 +29,8 @@ class AdminOverlayView(
         gravity = Gravity.CENTER
         setBackgroundColor(Color.parseColor("#180D0D")) // Dark warning reddish tone
         setPadding(64, 48, 64, 48)
+        isClickable = true
+        isFocusable = true
         isFocusableInTouchMode = true
         contentDescription = "LockKeeper Admin Authentication Screen"
         requestFocus()
@@ -179,6 +181,15 @@ class AdminOverlayView(
         errorTextView.text = "Too many incorrect attempts. Locked out for $remainingSeconds seconds."
         inputEditText.isEnabled = false
         submitButton.isEnabled = false
+    }
+
+    override fun dispatchTouchEvent(ev: android.view.MotionEvent): Boolean {
+        super.dispatchTouchEvent(ev)
+        return true // Never allow any touch on this security overlay to leak through to underlying windows!
+    }
+
+    override fun onTouchEvent(event: android.view.MotionEvent): Boolean {
+        return true
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {

@@ -32,7 +32,10 @@ class TamperDetectionEngine(
         private val DEACTIVATE_ADMIN_KEYWORDS = listOf(
             "deactivate this device admin app", "deactivate", "remove active admin",
             "desactivar esta aplicación de administración", "desactivar", "désactiver", "deaktivieren", "disattiva",
-            "desativar este app do administrador do dispositivo", "停用此设备管理应用", "このデバイス管理アプリを無効化"
+            "desativar este app do administrador do dispositivo", "停用此设备管理应用", "このデバイス管理アプリを無効化",
+            "this admin app is active", "admin app is active", "allows the app lockkeeper", "allows the app",
+            "deactivation", "unauthorized deactivation", "deactivat",
+            "desactivación", "désactivation", "deaktivierung", "disattivazione", "desativação"
         )
         private val DISABLE_KEYWORDS = listOf(
             "disable", "inhabilitar", "désactiver", "deaktivieren", "disabilita", "desativar", "停用", "無効化"
@@ -137,16 +140,22 @@ class TamperDetectionEngine(
         // Only trigger if Device Admin is ALREADY active. During onboarding setup, activating admin must be permitted!
         if (isDeviceAdminActive) {
             val isDeviceAdminScreen = lowerClass.contains("deviceadmin") ||
+                    lowerClass.contains("alertdialog") ||
+                    lowerClass.contains("dialog") ||
                     nodeCollector.containsTextOrDesc("device admin") ||
                     nodeCollector.containsTextOrDesc("administrador de dispositivos")
 
             val isGeneralAdminList = lowerClass.contains("settings\$deviceadminsettingsactivity") ||
                     lowerClass.contains("deviceadminsettings") ||
                     (nodeCollector.containsAnyTextOrDesc(listOf("device admin apps", "device admin settings", "administradores de dispositivos", "app de administración")) &&
-                     !nodeCollector.containsAnyTextOrDesc(listOf("deactivate this device admin app", "desactivar esta aplicación de administración", "deactivate")))
+                     !nodeCollector.containsAnyTextOrDesc(listOf("deactivate this device admin app", "desactivar esta aplicación de administración", "deactivate", "deactivation")))
 
             val hasDeactivateAction = nodeCollector.containsAnyTextOrDesc(DEACTIVATE_ADMIN_KEYWORDS) ||
                     nodeCollector.viewIds.any { it.contains("button_deactivate") || it.contains("action_button") }
+
+            try {
+                android.util.Log.i("TamperDetect", "mentionsLK=$mentionsLockKeeper isScreen=$isDeviceAdminScreen isGen=$isGeneralAdminList hasDeact=$hasDeactivateAction texts=${nodeCollector.texts}")
+            } catch (_: Throwable) {}
 
             // MUST be targeted deactivation screen, MUST mention LockKeeper, MUST have deactivate action, and MUST NOT be a general list
             if (isDeviceAdminScreen && !isGeneralAdminList && mentionsLockKeeper && hasDeactivateAction) {

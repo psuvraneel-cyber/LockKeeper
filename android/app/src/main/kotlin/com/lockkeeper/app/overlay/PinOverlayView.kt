@@ -33,6 +33,8 @@ class PinOverlayView(
         orientation = VERTICAL
         gravity = Gravity.CENTER
         setBackgroundColor(Color.parseColor("#0F172A")) // Deep dark background
+        isClickable = true
+        isFocusable = true
         isFocusableInTouchMode = true
         requestFocus()
 
@@ -213,6 +215,15 @@ class PinOverlayView(
 
         pinBuilder.clear()
         updateDots()
+    }
+
+    override fun dispatchTouchEvent(ev: android.view.MotionEvent): Boolean {
+        super.dispatchTouchEvent(ev)
+        return true
+    }
+
+    override fun onTouchEvent(event: android.view.MotionEvent): Boolean {
+        return true
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {

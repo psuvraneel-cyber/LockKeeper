@@ -17,7 +17,11 @@ enum class TamperSessionState {
     IDLE,
     PROMPTING,
     AUTHORIZED,
-    DENIED
+    CANCELLED,
+    EXPIRED,
+    INTERRUPTED,
+    SERVICE_DESTROYED,
+    TERMINAL_DENIAL
 }
 
 data class TamperSession(
@@ -29,8 +33,12 @@ data class TamperSession(
     val creationTime: Long = System.currentTimeMillis(),
     val creationElapsed: Long = 0L,
     @Volatile var state: TamperSessionState = TamperSessionState.PROMPTING,
-    @Volatile var isOverlayAttached: Boolean = false
-)
+    @Volatile var isOverlayAttached: Boolean = false,
+    @Volatile var terminalReason: String? = null
+) {
+    val isTerminal: Boolean
+        get() = state != TamperSessionState.IDLE && state != TamperSessionState.PROMPTING
+}
 
 class TamperAuthorizationController(
     private val credentialStore: CredentialStore,
@@ -68,7 +76,26 @@ class TamperAuthorizationController(
         adminGraceUntilElapsed = 0L
     }
 
-    fun startSession(event: TamperEvent): Boolean {
+    fun startOrGetSession(event: TamperEvent): TamperSession? = synchronized(this) {
+        if (isGraceActive()) {
+            return null
+        }
+        val current = activeSession
+        if (current != null && current.state == TamperSessionState.PROMPTING) {
+            // Already prompting: reuse existing session authoritatively (idempotent)
+            return current
+        }
+        val session = TamperSession(
+            event = event,
+            creationTime = wallClockTimeProvider(),
+            creationElapsed = monotonicTimeProvider(),
+            state = TamperSessionState.PROMPTING
+        )
+        activeSession = session
+        return session
+    }
+
+    fun startSession(event: TamperEvent): Boolean = synchronized(this) {
         if (isGraceActive()) {
             return false // Already authorized, no need to prompt
         }
@@ -86,13 +113,35 @@ class TamperAuthorizationController(
         return true
     }
 
-    fun endSession(authorized: Boolean) {
-        val session = activeSession ?: return
-        session.state = if (authorized) TamperSessionState.AUTHORIZED else TamperSessionState.DENIED
-        if (authorized) {
+    fun endSession(sessionId: String, terminalState: TamperSessionState, reason: String? = null): Boolean = synchronized(this) {
+        val current = activeSession ?: return false
+        if (current.sessionId != sessionId) {
+            // Stale callback from obsolete session: reject mutation
+            return false
+        }
+        if (current.isTerminal) {
+            return false
+        }
+        current.state = terminalState
+        current.terminalReason = reason
+        if (terminalState == TamperSessionState.AUTHORIZED) {
             grantGraceWindow()
         }
         activeSession = null
+        return true
+    }
+
+    fun endSession(authorized: Boolean) {
+        synchronized(this) {
+            val current = activeSession ?: return
+            val targetState = if (authorized) TamperSessionState.AUTHORIZED else TamperSessionState.TERMINAL_DENIAL
+            endSession(current.sessionId, targetState)
+        }
+    }
+
+    fun isSessionActive(sessionId: String): Boolean {
+        val current = activeSession ?: return false
+        return current.sessionId == sessionId && current.state == TamperSessionState.PROMPTING
     }
 
     suspend fun checkLockout(): Long? {

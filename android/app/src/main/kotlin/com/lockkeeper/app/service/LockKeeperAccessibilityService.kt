@@ -72,6 +72,15 @@ class LockKeeperAccessibilityService : AccessibilityService() {
                 repository.decisionEngine.clearAllSessions()
                 repository.selfLockManager.invalidateSession()
                 repository.recordAppBackgrounded()
+                val activeSession = repository.tamperController.activeSession
+                if (activeSession != null) {
+                    repository.tamperController.endSession(
+                        activeSession.sessionId,
+                        com.lockkeeper.app.security.TamperSessionState.INTERRUPTED,
+                        "Screen turned off"
+                    )
+                }
+                overlayManager.dismissAdminOverlay()
             }
         }
     }
@@ -80,6 +89,7 @@ class LockKeeperAccessibilityService : AccessibilityService() {
         super.onCreate()
         repository = ProtectionRepository.getInstance(this)
         overlayManager = OverlayManager.getInstance(this)
+        overlayManager.registerAccessibilityService(this)
         tamperEngine = com.lockkeeper.app.security.TamperDetectionEngine(packageName)
         val screenFilter = android.content.IntentFilter(android.content.Intent.ACTION_SCREEN_OFF)
         registerReceiver(screenReceiver, screenFilter)
@@ -88,6 +98,7 @@ class LockKeeperAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         isConnected = true
+        overlayManager.registerAccessibilityService(this)
         val info = AccessibilityServiceInfo().apply {
             eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
                     AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
@@ -108,7 +119,16 @@ class LockKeeperAccessibilityService : AccessibilityService() {
         try {
             unregisterReceiver(screenReceiver)
         } catch (_: Exception) {}
+        val activeSession = repository.tamperController.activeSession
+        if (activeSession != null) {
+            repository.tamperController.endSession(
+                activeSession.sessionId,
+                com.lockkeeper.app.security.TamperSessionState.SERVICE_DESTROYED,
+                "Service destroyed"
+            )
+        }
         overlayManager.dismissAll()
+        overlayManager.unregisterAccessibilityService()
         repository.decisionEngine.clearAllSessions()
         try {
             repository.notifySecurityStateChanged()
@@ -132,22 +152,21 @@ class LockKeeperAccessibilityService : AccessibilityService() {
         val packageName = event.packageName?.toString() ?: return
         val className = event.className?.toString() ?: ""
         val now = System.currentTimeMillis()
+        android.util.Log.i("LockKeeperA11y", "EVT: type=$eventType pkg=$packageName class=$className")
 
         // Immunity for soft keyboards (IME) - typing password or searching must NEVER dismiss overlays or sessions
         if (overlayManager.isInputMethodPackage(packageName)) {
             return
         }
 
-        // If the event is from LockKeeper and an overlay is showing, ignore to allow overlay interaction
-        if (packageName == this.packageName && overlayManager.isOverlayShowing()) {
-            return
+        // If the event is from LockKeeper and an overlay is showing or prompting, ignore to allow overlay interaction
+        if (packageName == this.packageName) {
+            if (overlayManager.isOverlayShowing() ||
+                repository.tamperController.activeSession?.state == com.lockkeeper.app.security.TamperSessionState.PROMPTING
+            ) {
+                return
+            }
         }
-
-        // Debounce identical events within 150ms
-        if (packageName == lastHandledPackage && (now - lastEventTimestamp) < 150L) {
-            return
-        }
-        lastEventTimestamp = now
 
         // Check for Tamper / Uninstallation / Settings tampering events across Settings, PackageInstallers, and OEM Centers
         if (repository.shouldProtectSettings()) {
@@ -155,8 +174,15 @@ class LockKeeperAccessibilityService : AccessibilityService() {
             val adminComponent = ComponentName(this, LockKeeperDeviceAdminReceiver::class.java)
             val isAdminActive = dpm?.isAdminActive(adminComponent) == true
 
-            val rootNode = rootInActiveWindow ?: event.source
+            val rootNode = rootInActiveWindow ?: run {
+                var node = event.source
+                while (node != null && node.parent != null) {
+                    node = node.parent
+                }
+                node
+            }
             val nodeFacade = rootNode?.let { AndroidNodeFacade(it) }
+            android.util.Log.i("LockKeeperA11y", "evaluating: pkg=$packageName class=$className isAdminActive=$isAdminActive rootNodeNull=${nodeFacade == null}")
 
             val tamperEvent = tamperEngine.evaluate(
                 packageName = packageName,
@@ -166,16 +192,31 @@ class LockKeeperAccessibilityService : AccessibilityService() {
             )
 
             if (tamperEvent != null && tamperEvent.confidence != com.lockkeeper.app.security.TamperConfidence.LOW) {
-                android.util.Log.d("LockKeeperA11y", "Tamper event detected: type=${tamperEvent.type}, source=${tamperEvent.source}")
+                android.util.Log.i("LockKeeperA11y", "Tamper event detected: type=${tamperEvent.type}, source=${tamperEvent.source}")
                 handleTamperEvent(tamperEvent, packageName)
                 return
-            } else if (isSystemManagementPackage(packageName)) {
-                // If an admin overlay is already active for this package, do NOT dismiss on transient fragment transitions!
-                if (!overlayManager.isOverlayShowing()) {
-                    overlayManager.dismissAdminOverlay()
+            } else if (repository.tamperController.activeSession?.state == com.lockkeeper.app.security.TamperSessionState.PROMPTING &&
+                isSystemManagementPackage(packageName)
+            ) {
+                // While an ADMIN session is PROMPTING inside a system management package,
+                // do NOT allow transient node fluctuations to dismiss the gate or drop to evaluatePackage!
+                val session = repository.tamperController.activeSession
+                if (session != null) {
+                    overlayManager.showAdminOverlay(targetPackage = packageName, session = session) { authenticated ->
+                        if (!authenticated) {
+                            performGlobalAction(GLOBAL_ACTION_HOME)
+                        }
+                    }
                 }
+                return
             }
         }
+
+        // Debounce identical non-tamper package evaluations within 150ms
+        if (packageName == lastHandledPackage && (now - lastEventTimestamp) < 150L) {
+            return
+        }
+        lastEventTimestamp = now
 
         // Handle app switch / exit from previous app
         val prev = lastHandledPackage
@@ -235,14 +276,13 @@ class LockKeeperAccessibilityService : AccessibilityService() {
             return
         }
 
-        val started = repository.tamperController.startSession(tamperEvent)
-        if (started) {
-            val session = repository.tamperController.activeSession
-            android.util.Log.d("LockKeeperA11y", "Displaying admin overlay for tamper defense over $targetPackage")
+        val session = repository.tamperController.startOrGetSession(tamperEvent)
+        if (session != null) {
+            android.util.Log.i("LockKeeperA11y", "Displaying admin overlay for tamper defense over $targetPackage (sessionId=${session.sessionId})")
             overlayManager.showAdminOverlay(targetPackage = targetPackage, session = session) { authenticated ->
                 if (!authenticated) {
-                    // Force navigation back or to home out of the tampering UI
-                    performGlobalAction(GLOBAL_ACTION_BACK)
+                    // Force navigation to home out of the tampering UI (fail-closed)
+                    performGlobalAction(GLOBAL_ACTION_HOME)
                 }
             }
         }

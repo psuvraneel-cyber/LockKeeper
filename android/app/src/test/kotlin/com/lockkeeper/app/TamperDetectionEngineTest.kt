@@ -581,4 +581,49 @@ class TamperDetectionEngineTest {
         assertNotNull("Dynamic content change presenting destructive button must trigger", updatedEvent)
         assertEquals(TamperType.UNINSTALL, updatedEvent?.type)
     }
+
+    @Test
+    fun `device admin active warning banner triggers tamper event immediately before button is loaded`() {
+        val root = FakeNode(
+            className = "android.widget.FrameLayout",
+            children = listOf(
+                FakeNode(text = "LockKeeper"),
+                FakeNode(text = "This admin app is active and allows the app LockKeeper to perform actions")
+            )
+        )
+
+        val event = engine.evaluate(
+            packageName = "com.android.settings",
+            className = "com.android.settings.DeviceAdminAdd",
+            rootNode = root,
+            isDeviceAdminActive = true
+        )
+
+        assertNotNull("Active admin banner must trigger tamper protection immediately", event)
+        assertEquals(TamperType.DISABLE_DEVICE_ADMIN, event?.type)
+        assertEquals(TamperSource.SETTINGS, event?.source)
+    }
+
+    @Test
+    fun `device admin deactivation confirmation alert dialog triggers tamper event`() {
+        val root = FakeNode(
+            className = "android.widget.FrameLayout",
+            children = listOf(
+                FakeNode(text = "LockKeeper device admin protects this device against unauthorized deactivation or uninstallation."),
+                FakeNode(text = "Cancel"),
+                FakeNode(text = "OK")
+            )
+        )
+
+        val event = engine.evaluate(
+            packageName = "com.android.settings",
+            className = "androidx.appcompat.app.AlertDialog",
+            rootNode = root,
+            isDeviceAdminActive = true
+        )
+
+        assertNotNull("Deactivation alert dialog must trigger tamper protection", event)
+        assertEquals(TamperType.DISABLE_DEVICE_ADMIN, event?.type)
+        assertEquals(TamperSource.SETTINGS, event?.source)
+    }
 }
