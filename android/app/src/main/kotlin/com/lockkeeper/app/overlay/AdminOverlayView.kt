@@ -193,8 +193,15 @@ class AdminOverlayView(
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (event.keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP) {
-            onCancelClicked()
+        if (event.keyCode == KeyEvent.KEYCODE_BACK) {
+            if (event.action == KeyEvent.ACTION_DOWN) {
+                return true
+            } else if (event.action == KeyEvent.ACTION_UP) {
+                if (!event.isCanceled) {
+                    onCancelClicked()
+                }
+                return true
+            }
             return true
         }
         return super.dispatchKeyEvent(event)

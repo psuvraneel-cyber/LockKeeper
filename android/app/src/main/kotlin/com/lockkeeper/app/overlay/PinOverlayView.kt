@@ -227,8 +227,15 @@ class PinOverlayView(
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (event.keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP) {
-            onBackInterception()
+        if (event.keyCode == KeyEvent.KEYCODE_BACK) {
+            if (event.action == KeyEvent.ACTION_DOWN) {
+                return true
+            } else if (event.action == KeyEvent.ACTION_UP) {
+                if (!event.isCanceled) {
+                    onBackInterception()
+                }
+                return true
+            }
             return true
         }
         return super.dispatchKeyEvent(event)

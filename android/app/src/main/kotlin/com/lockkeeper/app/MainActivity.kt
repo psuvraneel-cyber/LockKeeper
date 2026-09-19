@@ -29,7 +29,19 @@ class MainActivity : FlutterActivity() {
         super.onResume()
         channelHandler?.currentActivity = this
         updateSecureFlag()
+        reconcileProtectionService()
         ProtectionRepository.getInstance(applicationContext).notifySecurityStateChanged()
+    }
+
+    private fun reconcileProtectionService() {
+        val repo = ProtectionRepository.getInstance(applicationContext)
+        if (repo.isOnboardingCompleteSync() && !com.lockkeeper.app.service.LockKeeperForegroundService.isRunning) {
+            try {
+                com.lockkeeper.app.service.LockKeeperForegroundService.startService(applicationContext)
+            } catch (e: Exception) {
+                android.util.Log.e("MainActivity", "Failed to reconcile foreground protection service", e)
+            }
+        }
     }
 
     override fun onPause() {

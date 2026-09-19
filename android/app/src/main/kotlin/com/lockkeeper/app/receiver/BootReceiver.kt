@@ -12,10 +12,19 @@ import kotlinx.coroutines.launch
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action == Intent.ACTION_BOOT_COMPLETED || intent.action == "android.intent.action.QUICKBOOT_POWERON") {
+            val pendingResult = goAsync()
             val repository = ProtectionRepository.getInstance(context)
             CoroutineScope(Dispatchers.IO).launch {
-                if (repository.isOnboardingComplete()) {
-                    LockKeeperForegroundService.startService(context)
+                try {
+                    if (repository.isOnboardingComplete()) {
+                        LockKeeperForegroundService.startService(context)
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.e("BootReceiver", "Failed to start service on boot", e)
+                } finally {
+                    try {
+                        pendingResult.finish()
+                    } catch (_: Exception) {}
                 }
             }
         }

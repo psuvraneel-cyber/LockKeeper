@@ -21,6 +21,8 @@ class ProtectionRepository(
         com.lockkeeper.app.security.TamperAuthorizationController(credentialStore, database.appSettingsDao())
 ) {
     companion object {
+        const val STARTUP_CONNECTION_GRACE_MS = 2500L
+
         @Volatile
         private var INSTANCE: ProtectionRepository? = null
 
@@ -29,6 +31,17 @@ class ProtectionRepository(
                 INSTANCE ?: ProtectionRepository(context.applicationContext).also { INSTANCE = it }
             }
         }
+    }
+
+    @Volatile
+    private var startupElapsedRealtime = try {
+        android.os.SystemClock.elapsedRealtime()
+    } catch (_: RuntimeException) {
+        System.currentTimeMillis()
+    }
+
+    fun setStartupElapsedRealtimeForTesting(time: Long) {
+        startupElapsedRealtime = time
     }
 
     private val lockedAppDao = database.lockedAppDao()
@@ -162,6 +175,29 @@ class ProtectionRepository(
             val isGrace = tamperController.isGraceActive()
             val isProvisioned = settings.securityProvisioned && settings.onboardingComplete
 
+            val nowElapsed = try {
+                android.os.SystemClock.elapsedRealtime()
+            } catch (_: RuntimeException) {
+                System.currentTimeMillis()
+            }
+            val isStartupGraceActive = (nowElapsed - startupElapsedRealtime) < STARTUP_CONNECTION_GRACE_MS
+            val isA11yConnected = com.lockkeeper.app.service.LockKeeperAccessibilityService.isConnected
+            val enabledServices = try {
+                android.provider.Settings.Secure.getString(
+                    context.contentResolver,
+                    android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+                ) ?: ""
+            } catch (_: Exception) { "" }
+            val isA11yEnabled = enabledServices.contains(context.packageName)
+            val isA11yConnectingUnderGrace = isA11yEnabled && !isA11yConnected && isStartupGraceActive
+
+            val healthStatus = when {
+                isRecoveryReq -> "RECOVERY_REQUIRED"
+                !isProvisioned -> "SETUP_IN_PROGRESS"
+                isA11yConnectingUnderGrace -> "INITIALIZING"
+                else -> null
+            }
+
             decisionEngine.evaluate(
                 targetPackage = packageName,
                 lockedApp = app,
@@ -170,10 +206,12 @@ class ProtectionRepository(
                 isRecoveryRequired = isRecoveryReq,
                 isTamperLocked = isTamperLocked,
                 isTamperGraceActive = isGrace,
-                securityHealthStatus = if (isRecoveryReq) "RECOVERY_REQUIRED" else if (!isProvisioned) "SETUP_IN_PROGRESS" else null,
+                securityHealthStatus = healthStatus,
                 isSecurityProvisioned = isProvisioned,
                 isSetupInProgress = !isProvisioned && !isRecoveryReq
             )
+        } catch (c: kotlinx.coroutines.CancellationException) {
+            throw c
         } catch (e: Exception) {
             // INV-208: An exception in a security decision path must fail closed!
             LockDecision.DenyUnknown(ProtectionDecisionReason.DENIED_NATIVE_FAILURE)
@@ -344,6 +382,17 @@ class ProtectionRepository(
         val isRecoveryReq = checkRecoveryStatus()
         val isTamperLocked = tamperController.checkLockout() != null
 
+        val nowElapsed = try {
+            android.os.SystemClock.elapsedRealtime()
+        } catch (_: RuntimeException) {
+            System.currentTimeMillis()
+        }
+        val isStartupGraceActive = (nowElapsed - startupElapsedRealtime) < STARTUP_CONNECTION_GRACE_MS
+        val isA11yConnectingUnderGrace = isA11yEnabled && !isA11yConnected && isStartupGraceActive
+
+        val isFgsRunning = com.lockkeeper.app.service.LockKeeperForegroundService.isRunning
+        val isProvisioned = settings.securityProvisioned && settings.onboardingComplete
+
         val degradedReasons = mutableListOf<String>()
         if (isRecoveryReq) {
             degradedReasons.add("Security state desynchronization detected: Device Administrator is active but local credentials are missing. Recovery required.")
@@ -353,7 +402,7 @@ class ProtectionRepository(
         }
         if (!isA11yEnabled) {
             degradedReasons.add("Accessibility Service is not enabled in Android Settings")
-        } else if (!isA11yConnected) {
+        } else if (!isA11yConnected && !isStartupGraceActive) {
             degradedReasons.add("Accessibility Service is enabled in Settings but background service is disconnected")
         }
         if (!isOverlayGranted) {
@@ -371,12 +420,18 @@ class ProtectionRepository(
         if (!hasAdminPass) {
             degradedReasons.add("Admin Password is not configured")
         }
+        if (isProvisioned && !isFgsRunning) {
+            degradedReasons.add("Background protection service is not running")
+        }
 
-        val isProvisioned = settings.securityProvisioned && settings.onboardingComplete
+        val hasMissingPermissionsOrConfig = !isDeviceAdminActive || !isA11yEnabled || !isOverlayGranted || !isUsageGranted || !hasPin || !hasAdminPass || !isFgsRunning
+
         val overallStatus = when {
             isRecoveryReq -> "RECOVERY_REQUIRED"
             !isProvisioned -> "SETUP_IN_PROGRESS"
-            !isDeviceAdminActive || !isA11yOperational || !isOverlayGranted || !isUsageGranted || !hasPin || !hasAdminPass -> "DEGRADED"
+            hasMissingPermissionsOrConfig -> "DEGRADED"
+            isA11yConnectingUnderGrace -> "INITIALIZING"
+            !isA11yOperational -> "DEGRADED"
             appLockConfigured || settings.selfLockEnabled -> "PROTECTED"
             else -> "CONFIGURED"
         }

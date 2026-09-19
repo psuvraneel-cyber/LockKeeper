@@ -130,8 +130,15 @@ class CooldownOverlayView(
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (event.keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP) {
-            onExitClicked()
+        if (event.keyCode == KeyEvent.KEYCODE_BACK) {
+            if (event.action == KeyEvent.ACTION_DOWN) {
+                return true
+            } else if (event.action == KeyEvent.ACTION_UP) {
+                if (!event.isCanceled) {
+                    onExitClicked()
+                }
+                return true
+            }
             return true
         }
         return super.dispatchKeyEvent(event)

@@ -6,7 +6,16 @@ import java.util.concurrent.ConcurrentHashMap
 
 class LockDecisionEngine(
     private val appPackageName: String = "com.lockkeeper.app",
-    private val monotonicTimeProvider: () -> Long = { System.currentTimeMillis() }
+    private val monotonicTimeProvider: () -> Long = {
+        try {
+            android.os.SystemClock.elapsedRealtime()
+        } catch (_: RuntimeException) {
+            System.currentTimeMillis()
+        }
+    },
+    private val wallClockTimeProvider: () -> Long = {
+        System.currentTimeMillis()
+    }
 ) {
     companion object {
         const val MAX_FAILED_PIN_ATTEMPTS = 5
@@ -38,7 +47,7 @@ class LockDecisionEngine(
         adminGraceUntilMonotonic = 0L
     }
 
-    fun grantAppSession(packageName: String, currentTime: Long = monotonicTimeProvider()) {
+    fun grantAppSession(packageName: String, currentTime: Long = wallClockTimeProvider()) {
         activeSessions[packageName] = currentTime
     }
 
@@ -51,7 +60,7 @@ class LockDecisionEngine(
         adminGraceUntilMonotonic = 0L
     }
 
-    fun isAppSessionActive(packageName: String, currentTime: Long = monotonicTimeProvider()): Boolean {
+    fun isAppSessionActive(packageName: String, currentTime: Long = wallClockTimeProvider()): Boolean {
         val grantedAt = activeSessions[packageName] ?: return false
         val elapsed = currentTime - grantedAt
         if (elapsed in 0L..APP_SESSION_MAX_DURATION_MS) {
@@ -68,7 +77,7 @@ class LockDecisionEngine(
         targetPackage: String,
         lockedApp: LockedAppEntity?,
         appSettings: AppSettingsEntity?,
-        currentTime: Long = monotonicTimeProvider(),
+        currentTime: Long = wallClockTimeProvider(),
         isRecoveryRequired: Boolean = false,
         isTamperLocked: Boolean = false,
         isTamperGraceActive: Boolean = false,
@@ -98,7 +107,7 @@ class LockDecisionEngine(
         }
 
         // 5. System settings / admin package with active admin grace
-        if (isTamperGraceActive || isAdminGraceActive(currentTime)) {
+        if (isTamperGraceActive || isAdminGraceActive()) {
             if (targetPackage == "com.android.settings" || targetPackage.contains("packageinstaller") || targetPackage == appPackageName) {
                 return LockDecision.Allowed(ProtectionDecisionReason.ALLOWED_ADMIN_GRACE)
             }

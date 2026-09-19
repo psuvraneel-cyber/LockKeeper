@@ -5,6 +5,9 @@ import android.accessibilityservice.AccessibilityServiceInfo
 import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.os.Handler
 import android.os.Looper
 import android.view.accessibility.AccessibilityEvent
@@ -13,10 +16,12 @@ import com.lockkeeper.app.domain.LockDecision
 import com.lockkeeper.app.domain.ProtectionRepository
 import com.lockkeeper.app.overlay.OverlayManager
 import com.lockkeeper.app.receiver.LockKeeperDeviceAdminReceiver
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicLong
 
 class LockKeeperAccessibilityService : AccessibilityService() {
 
@@ -25,17 +30,21 @@ class LockKeeperAccessibilityService : AccessibilityService() {
         var isConnected: Boolean = false
             private set
 
-        fun isLauncherOrSystemUiPackage(pkg: String, pm: android.content.pm.PackageManager? = null): Boolean {
+        fun isSystemUiPackage(pkg: String): Boolean {
             val lower = pkg.lowercase()
-            if (lower == "com.android.systemui" || lower == "com.miui.powerkeeper" || lower.contains(".systemui")) {
-                return true
-            }
+            return lower == "com.android.systemui" ||
+                    lower == "com.miui.powerkeeper" ||
+                    lower.contains(".systemui")
+        }
+
+        fun isLauncherPackage(pkg: String, pm: PackageManager? = null): Boolean {
+            val lower = pkg.lowercase()
             if (pm != null) {
                 try {
-                    val homeIntent = android.content.Intent(android.content.Intent.ACTION_MAIN).apply {
-                        addCategory(android.content.Intent.CATEGORY_HOME)
+                    val homeIntent = Intent(Intent.ACTION_MAIN).apply {
+                        addCategory(Intent.CATEGORY_HOME)
                     }
-                    val defaultLauncher = pm.resolveActivity(homeIntent, android.content.pm.PackageManager.MATCH_DEFAULT_ONLY)?.activityInfo?.packageName
+                    val defaultLauncher = pm.resolveActivity(homeIntent, PackageManager.MATCH_DEFAULT_ONLY)?.activityInfo?.packageName
                     if (defaultLauncher != null && defaultLauncher.equals(pkg, ignoreCase = true)) {
                         return true
                     }
@@ -53,6 +62,21 @@ class LockKeeperAccessibilityService : AccessibilityService() {
                     lower.endsWith(".launcher") ||
                     lower.endsWith(".home")
         }
+
+        fun isSystemManagementPackage(pkg: String): Boolean {
+            val lower = pkg.lowercase()
+            return lower == "com.android.settings" ||
+                    lower.contains("packageinstaller") ||
+                    lower == "com.android.vending" ||
+                    lower == "com.miui.securitycenter" ||
+                    lower == "com.samsung.android.lool" ||
+                    lower == "com.coloros.safecenter" ||
+                    lower == "com.vivo.abe"
+        }
+
+        fun isLauncherOrSystemUiPackage(pkg: String, pm: PackageManager? = null): Boolean {
+            return isSystemUiPackage(pkg) || isLauncherPackage(pkg, pm)
+        }
     }
 
     private val serviceScope = CoroutineScope(Dispatchers.Default)
@@ -64,10 +88,11 @@ class LockKeeperAccessibilityService : AccessibilityService() {
     private var lastHandledPackage: String? = null
     private var lastEventTimestamp: Long = 0L
     private var evaluationJob: Job? = null
+    private val evaluationSequence = AtomicLong(0)
 
     private val screenReceiver = object : android.content.BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: android.content.Intent?) {
-            if (intent?.action == android.content.Intent.ACTION_SCREEN_OFF) {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == Intent.ACTION_SCREEN_OFF) {
                 // INV-318: Screen off immediately purges all transient app sessions and self-lock
                 repository.decisionEngine.clearAllSessions()
                 repository.selfLockManager.invalidateSession()
@@ -91,7 +116,7 @@ class LockKeeperAccessibilityService : AccessibilityService() {
         overlayManager = OverlayManager.getInstance(this)
         overlayManager.registerAccessibilityService(this)
         tamperEngine = com.lockkeeper.app.security.TamperDetectionEngine(packageName)
-        val screenFilter = android.content.IntentFilter(android.content.Intent.ACTION_SCREEN_OFF)
+        val screenFilter = IntentFilter(Intent.ACTION_SCREEN_OFF)
         registerReceiver(screenReceiver, screenFilter)
     }
 
@@ -137,7 +162,8 @@ class LockKeeperAccessibilityService : AccessibilityService() {
     }
 
     override fun onInterrupt() {
-        overlayManager.dismissAll()
+        // Accessibility interrupts (e.g. system UI dialogs, audio focus) must NEVER
+        // blindly terminate unrelated active enforcement sessions or dismiss security overlays.
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -154,12 +180,27 @@ class LockKeeperAccessibilityService : AccessibilityService() {
         val now = System.currentTimeMillis()
         android.util.Log.i("LockKeeperA11y", "EVT: type=$eventType pkg=$packageName class=$className")
 
-        // Immunity for soft keyboards (IME) - typing password or searching must NEVER dismiss overlays or sessions
+        // 1. EARLY SYSTEM UI FILTER: Filter com.android.systemui at the earliest practical point
+        if (isSystemUiPackage(packageName)) {
+            return
+        }
+
+        // 2. Immunity for soft keyboards (IME)
         if (overlayManager.isInputMethodPackage(packageName)) {
             return
         }
 
-        // If the event is from LockKeeper and an overlay is showing or prompting, ignore to allow overlay interaction
+        // 3. Event Type Specificity:
+        // Ordinary app-lock transitions are driven by TYPE_WINDOW_STATE_CHANGED.
+        // Only evaluate TYPE_WINDOW_CONTENT_CHANGED for system management apps when settings protection is active.
+        if (eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
+            if (!isSystemManagementPackage(packageName) || !repository.shouldProtectSettings()) {
+                return
+            }
+        }
+
+        // 4. LockKeeper Intermediate Event Guard:
+        // If the event is from LockKeeper and an overlay is showing or prompting, ignore to preserve interaction.
         if (packageName == this.packageName) {
             if (overlayManager.isOverlayShowing() ||
                 repository.tamperController.activeSession?.state == com.lockkeeper.app.security.TamperSessionState.PROMPTING
@@ -168,7 +209,7 @@ class LockKeeperAccessibilityService : AccessibilityService() {
             }
         }
 
-        // Check for Tamper / Uninstallation / Settings tampering events across Settings, PackageInstallers, and OEM Centers
+        // Check for Tamper / Uninstallation / Settings tampering events
         if (repository.shouldProtectSettings()) {
             val dpm = getSystemService(Context.DEVICE_POLICY_SERVICE) as? DevicePolicyManager
             val adminComponent = ComponentName(this, LockKeeperDeviceAdminReceiver::class.java)
@@ -198,8 +239,6 @@ class LockKeeperAccessibilityService : AccessibilityService() {
             } else if (repository.tamperController.activeSession?.state == com.lockkeeper.app.security.TamperSessionState.PROMPTING &&
                 isSystemManagementPackage(packageName)
             ) {
-                // While an ADMIN session is PROMPTING inside a system management package,
-                // do NOT allow transient node fluctuations to dismiss the gate or drop to evaluatePackage!
                 val session = repository.tamperController.activeSession
                 if (session != null) {
                     overlayManager.showAdminOverlay(targetPackage = packageName, session = session) { authenticated ->
@@ -218,12 +257,13 @@ class LockKeeperAccessibilityService : AccessibilityService() {
         }
         lastEventTimestamp = now
 
-        // Handle app switch / exit from previous app
+        // Reworked App-Exit Detection:
         val prev = lastHandledPackage
         if (prev != null && prev != packageName) {
             if (prev == this.packageName) {
                 repository.recordAppBackgrounded(now)
-            } else if (!isSystemManagementPackage(prev) && packageName != this.packageName) {
+            } else if (!isSystemManagementPackage(prev) && !isLauncherPackage(prev)) {
+                // User genuinely navigated away from protected app `prev`
                 serviceScope.launch {
                     repository.handleAppExited(prev)
                 }
@@ -231,36 +271,48 @@ class LockKeeperAccessibilityService : AccessibilityService() {
         }
         lastHandledPackage = packageName
 
-        // Evaluate target package
+        // Evaluate target package with generation/session validation
+        val currentSeq = evaluationSequence.incrementAndGet()
         evaluationJob?.cancel()
         evaluationJob = serviceScope.launch {
-            val decision = repository.evaluatePackage(packageName)
-            mainHandler.post {
-                when (decision) {
-                    is LockDecision.RequirePin -> {
-                        overlayManager.showPinOverlay(packageName)
-                    }
-                    is LockDecision.StrictCooldown -> {
-                        overlayManager.showCooldownOverlay(packageName, decision.remainingSeconds)
-                    }
-                    is LockDecision.PinLockout -> {
-                        overlayManager.showLockoutOverlay(packageName, decision.remainingSeconds)
-                    }
-                    is LockDecision.Allowed -> {
-                        overlayManager.dismissIfShowing(packageName)
-                    }
-                    is LockDecision.Blocked,
-                    is LockDecision.RecoveryRequired,
-                    is LockDecision.DenyUnknown -> {
-                        // Fail-closed: dismiss any lingering overlay and force navigation away from target app
-                        overlayManager.dismissIfShowing(packageName)
-                        // CRITICAL: Never dispatch GLOBAL_ACTION_HOME if target package is already launcher or system UI
-                        if (!isLauncherOrSystemUiPackage(packageName)) {
-                            performGlobalAction(GLOBAL_ACTION_HOME)
-                        }
-                    }
-                    else -> {}
+            try {
+                val decision = repository.evaluatePackage(packageName)
+                if (currentSeq != evaluationSequence.get() || packageName != lastHandledPackage) {
+                    return@launch
                 }
+
+                mainHandler.post {
+                    if (currentSeq != evaluationSequence.get() || packageName != lastHandledPackage) {
+                        return@post
+                    }
+                    when (decision) {
+                        is LockDecision.RequirePin -> {
+                            overlayManager.showPinOverlay(packageName)
+                        }
+                        is LockDecision.StrictCooldown -> {
+                            overlayManager.showCooldownOverlay(packageName, decision.remainingSeconds)
+                        }
+                        is LockDecision.PinLockout -> {
+                            overlayManager.showLockoutOverlay(packageName, decision.remainingSeconds)
+                        }
+                        is LockDecision.Allowed -> {
+                            overlayManager.dismissIfShowing(packageName)
+                        }
+                        is LockDecision.Blocked,
+                        is LockDecision.RecoveryRequired,
+                        is LockDecision.DenyUnknown -> {
+                            if (!isLauncherPackage(packageName) && !isSystemUiPackage(packageName)) {
+                                performGlobalAction(GLOBAL_ACTION_HOME)
+                            }
+                            mainHandler.postDelayed({
+                                overlayManager.dismissIfShowing(packageName)
+                            }, 250L)
+                        }
+                        else -> {}
+                    }
+                }
+            } catch (_: CancellationException) {
+                // Superseded by a newer evaluation job; do not post DenyUnknown
             }
         }
     }
@@ -281,25 +333,10 @@ class LockKeeperAccessibilityService : AccessibilityService() {
             android.util.Log.i("LockKeeperA11y", "Displaying admin overlay for tamper defense over $targetPackage (sessionId=${session.sessionId})")
             overlayManager.showAdminOverlay(targetPackage = targetPackage, session = session) { authenticated ->
                 if (!authenticated) {
-                    // Force navigation to home out of the tampering UI (fail-closed)
                     performGlobalAction(GLOBAL_ACTION_HOME)
                 }
             }
         }
-    }
-
-    private fun isLauncherOrSystemUiPackage(pkg: String): Boolean =
-        Companion.isLauncherOrSystemUiPackage(pkg, packageManager)
-
-    private fun isSystemManagementPackage(pkg: String): Boolean {
-        val lower = pkg.lowercase()
-        return lower == "com.android.settings" ||
-                lower.contains("packageinstaller") ||
-                lower == "com.android.vending" ||
-                lower == "com.miui.securitycenter" ||
-                lower == "com.samsung.android.lool" ||
-                lower == "com.coloros.safecenter" ||
-                lower == "com.vivo.abe"
     }
 
     private class AndroidNodeFacade(private val node: AccessibilityNodeInfo) : com.lockkeeper.app.security.NodeFacade {

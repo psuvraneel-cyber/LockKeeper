@@ -27,6 +27,10 @@ android {
         versionName = flutter.versionName
     }
 
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+
     signingConfigs {
         create("release") {
             val keystorePropertiesFile = rootProject.file("key.properties")
